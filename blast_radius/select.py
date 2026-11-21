@@ -16,9 +16,12 @@ import re
 import time
 import tokenize
 
+from .equivalence import same_module
 from .patches import FileDiff, apply_to_text, parse_patch
 from .probe import probe
-from .scheduling import schedule
+from .recall import eager_imports_changed, shared_fixture_consumers
+from .replay import equivalent, expression_change
+from .scheduling import fill_idle_time, schedule
 
 
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -97,10 +100,13 @@ class Selector:
     def __init__(self, source: Path, index: dict, tests: list[Test]):
         self.source = source
         self.files = index["files"]
+        self.has_shared_scopes = any("shared" in file for file in self.files.values())
         self.readers = index["data_reads"]
         self.collection_reads = index["collection_reads"]
         self.dialects = index.get("dialects", {})
         self.expressions = index.get("expressions", {})
+        self.operand_sites = {}
+        self.operand_files = set()
         nodes = index["nodes"]
         self.by_number = {t.number: t for t in tests}
         self.all = set(self.by_number)
@@ -197,7 +203,7 @@ class Selector:
             patched_value = other.value
             other.value = assignment.value
             try:
-                if ast.dump(old_tree) != ast.dump(new_tree):
+                if not same_module(old_tree, new_tree, change.old_lines):
                     return None
             finally:
                 other.value = patched_value
@@ -205,7 +211,7 @@ class Selector:
             return self.translate(self.expressions.get(key, ()))
         return None
 
-    def python_effects(self, path: str, change: FileDiff):
+    def python_effects(self, path: str, change: FileDiff, single_file=True):
         info = self.files.get(path, {"lines": {}, "collection": []})
         owned = self.by_file.get(path, set())
         old_text = read_source(self.source / path)
@@ -219,7 +225,7 @@ class Selector:
             return owned if owned and not self.test_module_is_shared(path) else self.all
         old_tree = ast.parse(old_text, filename=path, type_comments=True)
         readers = self.translate(self.readers.get(path, ()))
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if same_module(old_tree, new_tree, change.old_lines):
             if not DIRECTIVE.search("\n".join(
                 line for hunk in change.hunks for kind, line in hunk.lines if kind != " "
             )):
@@ -247,21 +253,42 @@ class Selector:
                 import_time = True
             else:
                 import_time = True
-        affected = self.lines(info, changed_lines) | owned | readers
+        # A function body can execute while pytest imports its test modules
+        # (metaclasses and default factories are common examples).
+        if not import_time and changed_lines.intersection(info["collection"]):
+            import_time = True
+        runtime = self.lines(info, changed_lines)
+        if single_file and not import_time and path in self.operand_files:
+            mutation = expression_change(shape, change, old_tree, new_tree)
+            if mutation:
+                original, operation, edits = mutation
+                key = f"{path}:{original.lineno}:{original.col_offset}"
+                for samples, group in self.operand_sites.get(key, ()):
+                    if equivalent(samples, type(original.ops[0]), operation, edits):
+                        runtime.difference_update(self.translate(group))
+        for line in changed_lines:
+            cohort = info.get("shared", {}).get(str(line))
+            if cohort is not None:
+                runtime.update(self.cohorts[cohort])
+        affected = runtime | owned | readers
         if import_time:
+            if path.startswith("sqlglot/") and eager_imports_changed(old_tree, new_tree):
+                return self.all
             arg_types = self.arg_type_consumers(path, shape, change, old_tree, new_tree)
             affected = self.collection_effects(path, affected) if arg_types is None else affected | arg_types
         return affected | self.uncovered
 
     def data_effects(self, path: str):
         affected = self.translate(self.readers.get(path, ()))
+        if not self.has_shared_scopes:
+            affected.update(shared_fixture_consumers(self, affected))
         for reader in self.collection_reads.get(path, ()):
             if reader not in self.by_file:
                 return self.all
             affected.update(self.by_file[reader])
         return affected or self.all
 
-    def one_file(self, change: FileDiff):
+    def one_file(self, change: FileDiff, single_file=True):
         paths = {p for p in (change.old_path, change.new_path) if p}
         if paths and all(p in PROJECT_FILES or p.startswith(RUNTIME_ROOTS) for p in paths):
             if change.binary or change.old_path != change.new_path:
@@ -274,7 +301,7 @@ class Selector:
             if not change.hunks:
                 return self.all
             if path.endswith(".py"):
-                return self.python_effects(path, change)
+                return self.python_effects(path, change, single_file)
             return self.data_effects(path)
 
         if paths and all(p.startswith(SAFE_DOC_ROOTS) or (
@@ -290,7 +317,7 @@ class Selector:
             if not changes and text.strip():
                 return set(self.all)
             for change in changes:
-                selected.update(self.one_file(change))
+                selected.update(self.one_file(change, len(changes) == 1))
                 if len(selected) == len(self.all):
                     break
         except (TypeError, ValueError, OSError, SyntaxError, UnicodeError, RecursionError):
@@ -309,10 +336,23 @@ def main():
              for t in catalogue["tests"]]
     try:
         with gzip.open(args.index, "rt", encoding="utf-8") as stream:
-            selector = Selector(args.source, json.load(stream), tests)
+            index = json.load(stream)
+            nodes = index["nodes"]
+            selector = Selector(args.source, index, tests)
     except (OSError, ValueError, KeyError):
         selector = None
+    if selector is not None:
+        try:
+            with gzip.open(args.index.with_name("operands.json.gz"), "rt", encoding="utf-8") as stream:
+                operand_index = json.load(stream)
+            if operand_index["nodes"] == nodes:
+                selector.operand_sites = operand_index["sites"]
+                selector.operand_files = {site.rsplit(":", 2)[0] for site in selector.operand_sites}
+        except (OSError, ValueError, KeyError):
+            pass
     by_number = {t.number: t for t in tests}
+    durations = {t.number: t.duration for t in tests}
+    extras = sorted(durations.items(), key=lambda pair: (pair[1], pair[0]))
     can_probe = selector is not None and os.getenv("RWX_PROBE", "0") == "1"
     deadline = time.monotonic() + 35
     for patch in sorted((args.data / "commits").glob("*.patch")):
@@ -333,6 +373,7 @@ def main():
                 selected = [(n, duration) for n, duration in selected
                             if n in selector.uncovered or by_number[n].node not in result.passed]
                 workers = schedule(selected)
+        fill_idle_time(workers, durations, extras)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     return 0
 

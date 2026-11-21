@@ -21,8 +21,16 @@ RUN python -m pip install --no-cache-dir coverage==7.17.4
 COPY blast_radius /app/blast_radius
 RUN python -m blast_radius.make_index /sqlglot /app/coverage.json.gz
 
+FROM sqlglot-base AS operand-index
+COPY blast_radius /app/blast_radius
+COPY tools/operand_startup /app/operand_startup
+RUN mkdir /tmp/operand-coverage \
+    && RWX_OBSERVE_ROOT=/sqlglot RWX_OBSERVE_OUTPUT=/tmp/operand-coverage \
+       PYTHONPATH=/app/operand_startup:/app python -c 'from blast_radius.operand_index import run; raise SystemExit(run())' \
+    && python -m blast_radius.operand_index /tmp/operand-coverage /app/operands.json.gz
+
 FROM sqlglot-base AS submission
 COPY blast_radius /app/blast_radius
-COPY coverage.json.gz /app/coverage.json.gz
+COPY coverage.json.gz operands.json.gz /app/
 USER 65534:65534
 CMD ["python", "-m", "blast_radius.select"]

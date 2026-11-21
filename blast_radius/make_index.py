@@ -45,6 +45,14 @@ def main() -> int:
     collection_reads = defaultdict(set)
     nodes = []
     baseline_nonpasses = set()
+    descendants = defaultdict(set)
+    fixture_members = {}
+    fixture_keys = {}
+
+    def switch_context(name):
+        nonlocal context
+        context = model_use.node = name
+        cov.switch_context(name)
 
     def audit(event, values):
         if event != "open" or not isinstance(values[0], str):
@@ -86,17 +94,48 @@ def main() -> int:
     class Recorder:
         @pytest.hookimpl(wrapper=True)
         def pytest_runtest_protocol(self, item, nextitem):
-            nonlocal context
-            context = model_use.node = item.nodeid
-            cov.switch_context(context)
+            previous = context
+            switch_context(item.nodeid)
             try:
                 return (yield)
             finally:
-                cov.switch_context("")
-                context = model_use.node = ""
+                switch_context(previous)
+
+        @pytest.hookimpl(wrapper=True, tryfirst=True)
+        def pytest_fixture_setup(self, fixturedef, request):
+            if request.scope == "function":
+                return (yield)
+            scope = request.node
+            if scope not in fixture_keys:
+                key = f"fixture-scope:{len(fixture_keys)}"
+                fixture_keys[scope] = key
+                fixture_members[key] = descendants[scope]
+            key = fixture_keys[scope]
+            # pytest runs registered finalizers in reverse order. Bracket
+            # teardown with the same context as setup, including on errors.
+            teardown_parent = []
+
+            def start_teardown():
+                teardown_parent.append(context)
+                switch_context(key)
+
+            def end_teardown():
+                switch_context(teardown_parent.pop())
+
+            request.addfinalizer(end_teardown)
+            previous = context
+            switch_context(key)
+            try:
+                return (yield)
+            finally:
+                switch_context(previous)
+                request.addfinalizer(start_teardown)
 
         def pytest_collection_finish(self, session):
-            nodes.extend(item.nodeid for item in session.items)
+            for item in session.items:
+                nodes.append(item.nodeid)
+                for collector in item.listchain():
+                    descendants[collector].add(item.nodeid)
             model_use.install()
 
         def pytest_runtest_logreport(self, report):
@@ -157,8 +196,20 @@ def main() -> int:
     cohorts = []
     cohort_ids = {}
 
+    fixture_numbers = {key: {numbers[node] for node in members}
+                       for key, members in fixture_members.items()}
+
+    def expanded(contexts):
+        ids = set()
+        for name in contexts:
+            if name in numbers:
+                ids.add(numbers[name])
+            elif name in fixture_numbers:
+                ids.update(fixture_numbers[name])
+        return sorted(ids)
+
     def cohort(test_nodes):
-        ids = tuple(sorted({numbers[node] for node in test_nodes if node in numbers}))
+        ids = tuple(expanded(test_nodes))
         if ids not in cohort_ids:
             cohort_ids[ids] = len(cohorts)
             cohorts.append(ids)
@@ -170,18 +221,17 @@ def main() -> int:
         files[path] = {
             "lines": {line: cohort(test_nodes) for line, test_nodes in sorted(execution.items())},
             "collection": sorted(line for line, names in execution.items() if "" in names),
+            "shared": {line: cohort(shared) for line, names in sorted(execution.items())
+                       if (shared := fixture_numbers.keys() & names)},
         }
     index = {
         "nodes": nodes,
         "cohorts": cohorts,
         "files": files,
-        "data_reads": {path: sorted(numbers[n] for n in ids if n in numbers)
-                       for path, ids in sorted(opened.items())},
+        "data_reads": {path: expanded(ids) for path, ids in sorted(opened.items())},
         "collection_reads": {path: sorted(readers) for path, readers in sorted(collection_reads.items())},
-        "dialects": {path: sorted(numbers[n] for n in ids if n in numbers)
-                     for path, ids in sorted(model_use.dialects.items())},
-        "expressions": {name: sorted(numbers[n] for n in ids if n in numbers)
-                        for name, ids in sorted(model_use.expressions.items())},
+        "dialects": {path: expanded(ids) for path, ids in sorted(model_use.dialects.items())},
+        "expressions": {name: expanded(ids) for name, ids in sorted(model_use.expressions.items())},
         "nonpasses": sorted(baseline_nonpasses),
     }
     output.parent.mkdir(parents=True, exist_ok=True)

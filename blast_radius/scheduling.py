@@ -152,3 +152,22 @@ def schedule(tests: list[Test]) -> list[list[int]]:
                 target = (low + high) // 2
 
     return [[number for number, _ in group] for group in best_workers if group]
+
+
+def fill_idle_time(workers, durations, extras):
+    """Add unscheduled catalogue tests that fit under the current peak load."""
+    if not workers:
+        return
+    selected = {n for group in workers for n in group}
+    loads = [sum(durations[n] for n in group) for group in workers]
+    peak = max(loads)
+    remaining = [peak - load for load in loads]
+    for number, duration in extras:
+        if number in selected:
+            continue
+        worker = max(range(len(remaining)), key=remaining.__getitem__)
+        if duration > remaining[worker]:
+            # Extras are sorted by duration. No subsequent test can fit either.
+            break
+        workers[worker].append(number)
+        remaining[worker] -= duration
