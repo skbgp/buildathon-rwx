@@ -12,6 +12,8 @@ A second run of the clean suite records operand samples for comparisons, capped 
 
 For isolated class configuration edits, the selector consults clean-suite records of scalar attribute lookups on dialects, parsers and generators, and individual dictionary key reads. For boolean flags in a short-circuit condition, the profile can discount a read when a side-effect-free second operand already determines the result. For changes to an expression’s required arguments, the profile records which tests validated an object with the affected argument missing. A bulk dictionary read or an import-time dependency triggers a wider selection. Handler tables have a separate index of calls to individual lambdas and closures returned by simple factories. Complex factories use the existing coverage fallback.
 
+For an isolated change to a literal parameter default, a clean profile records tests entering the function with the original value and tests inspecting its defaults. Unknown import or shared-fixture contexts fall back to the ordinary selector. Decorated functions, generators, and combined signature and body edits also use that fallback.
+
 Workers are assigned using the recorded test durations and the two-second cost per worker. The scheduler checks one through eight workers, balances the load, and attempts a bounded exact search for small selections when the lower bound suggests a better arrangement. Unscheduled short tests can use spare worker time up to the existing peak.
 
 ## Build and verify
@@ -45,6 +47,8 @@ python3 tools/verify_sample.py "$kit" --source /path/to/pinned/sqlglot \
 
 Against commit `5a724c1`, the public sample improved from 106.632 to 104.118 simulated seconds with all 73 failures selected. Twelve additional local patches to parser flags, generator flags and expression schemas improved from 311.353 to 85.637 seconds, with all 39 failing test/patch pairs selected. The older 17-patch validation batch improved from 136.502 to 136.419 seconds with all 102 pairs selected. These batches have different patch mixes from the organizer’s practice and final batches.
 
+Against commit `36414fd`, the default-argument selector reduced a separately sampled 12-change mixed batch from 112.495 to 92.911 simulated seconds. One change accounted for the improvement. On three additional random default edits, the cost fell from 73.504 to 53.455 seconds. Full-suite runs provided the failure labels for both batches.
+
 ## Refresh the coverage maps
 
 The index is generated only from clean upstream tests. No labeled patches are used to generate it. The Docker build uses the organizer's pinned Python image and dependency lock. [coverage.py](https://github.com/nedbat/coveragepy) records which lines each pytest item executes.
@@ -61,7 +65,7 @@ docker cp "$container:/app/operands.json.gz" operands.json.gz
 docker rm "$container"
 ```
 
-The additional profiles use the same pinned source and tests. Build the `configuration-index` target with its default `PROFILE=1` argument to reproduce the dictionary map, or with `--build-arg PROFILE=dispatch` to trace callable dispatch. Both targets write `/app/profile.json.gz`. The `scalar-index` target writes `/app/scalars.json.gz`. The `expression-index` target writes `/app/expressions.json.gz`.
+The additional profiles use the same pinned source and tests. Build the `configuration-index` target with its default `PROFILE=1` argument to reproduce the dictionary map, or with `--build-arg PROFILE=dispatch` to trace callable dispatch. Both targets write `/app/profile.json.gz`. The `default-index` target writes `/app/defaults.json.gz`. The `scalar-index` target writes `/app/scalars.json.gz`. The `expression-index` target writes `/app/expressions.json.gz`.
 
 Each build of the submission image downloads the pinned SQLGlot archive and verifies its SHA-256. The submission build reuses the index from this repository. Optional local pytest probes can be enabled with `RWX_PROBE=1`.
 

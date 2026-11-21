@@ -41,14 +41,18 @@ def install():
     Finalize(None, save, exitpriority=-5)
 
 
+def set_context(name):
+    operands.active_node = name
+
+
 def job(node, payload):
     install()
-    operands.active_node = node
+    set_context(node)
     try:
         fn, args, kwargs = ForkingPickler.loads(payload)
         return bytes(ForkingPickler.dumps(fn(*args, **kwargs)))
     finally:
-        operands.active_node = ""
+        set_context("")
 
 
 def run():
@@ -79,11 +83,11 @@ def run():
     class Recorder:
         @pytest.hookimpl(wrapper=True)
         def pytest_runtest_protocol(self, item, nextitem):
-            operands.active_node = item.nodeid
+            set_context(item.nodeid)
             try:
                 return (yield)
             finally:
-                operands.active_node = ""
+                set_context("")
 
         def pytest_collection_finish(self, session):
             Path(os.environ["RWX_OBSERVE_OUTPUT"], "nodes.json").write_text(

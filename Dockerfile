@@ -53,8 +53,16 @@ RUN mkdir /tmp/profile \
        PYTHONPATH=/app/blast_radius/scalar_startup:/app python -c 'from blast_radius.scalar_index import run; raise SystemExit(run())' \
     && python -m blast_radius.scalar_index /tmp/profile /app/scalars.json.gz
 
+FROM sqlglot-base AS default-index
+COPY blast_radius /app/blast_radius
+COPY tools/default_startup /app/default_startup
+RUN mkdir /tmp/profile \
+    && RWX_OBSERVE_ROOT=/sqlglot RWX_OBSERVE_OUTPUT=/tmp/profile \
+       PYTHONPATH=/app/default_startup:/app python -c 'from blast_radius.scalar_index import run; raise SystemExit(run())' \
+    && python -m blast_radius.scalar_index /tmp/profile /app/defaults.json.gz
+
 FROM sqlglot-base AS submission
 COPY blast_radius /app/blast_radius
-COPY coverage.json.gz operands.json.gz configurations.json.gz dispatch.json.gz scalars.json.gz expressions.json.gz /app/
+COPY coverage.json.gz operands.json.gz configurations.json.gz dispatch.json.gz scalars.json.gz expressions.json.gz defaults.json.gz /app/
 USER 65534:65534
 CMD ["python", "-m", "blast_radius.select"]

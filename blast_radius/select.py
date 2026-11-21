@@ -23,7 +23,7 @@ from .equivalence import same_module, same_patched_module
 from .patches import FileDiff, apply_to_text, parse_patch
 from .probe import probe
 from .recall import eager_imports_changed, shared_fixture_consumers
-from . import arguments, lazy, scalar
+from . import arguments, defaults, lazy, scalar
 from .replay import equivalent, expression_change
 from .scheduling import fill_idle_time, schedule
 
@@ -176,6 +176,8 @@ class Selector:
         self.collection_reads = index["collection_reads"]
         self.dialects = index.get("dialects", {})
         self.expressions = index.get("expressions", {})
+        self.default_sites = {}
+        self.default_paths = set()
         self.scalar_reads = {}
         self.operand_sites = {}
         self.dispatch = {}
@@ -376,6 +378,14 @@ class Selector:
             return owned if owned and not self.test_module_is_shared(path) else self.all
         if len(change.hunks) > 1 or (change.old_lines and change.insertion_anchors):
             change, new_tree = localize_mixed_edits(path, change, old_text, new_tree)
+        if single_file and path in self.default_paths and not any(
+            DIRECTIVE.search(line) for hunk in change.hunks for kind, line in hunk.lines if kind != " "
+        ):
+            nodes = defaults.contexts(path, change, old_tree, new_tree, self.default_sites)
+            if nodes is not None:
+                consumers = self.translate(nodes)
+                # Shared fixtures and imports are recorded as unknown by the default profiler.
+                return readers | owned | consumers | self.uncovered
         if single_file and path in self.dispatch_paths:
             site = changed_site(path, change, old_tree, new_tree, self.dispatch)
             if site is not None:
@@ -563,6 +573,8 @@ def main():
         selector.dispatch_paths = paths(selector.dispatch)
         selector.lazy_sites = profile("expressions.json.gz", "maps")
         selector.lazy_paths = paths(selector.lazy_sites)
+        selector.default_sites = profile("defaults.json.gz", "scalars")
+        selector.default_paths = paths(selector.default_sites)
         selector.scalar_reads = profile("scalars.json.gz", "scalars")
     by_number = {t.number: t for t in tests}
     durations = {t.number: t.duration for t in tests}

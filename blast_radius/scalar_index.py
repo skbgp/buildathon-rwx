@@ -204,22 +204,23 @@ class Fixtures:
     def pytest_fixture_setup(self, fixturedef, request):
         if request.scope == "function":
             return (yield)
+        from . import operand_index
         prior = operands.active_node
         teardown_prior = []
 
         def begin_teardown():
             teardown_prior.append(operands.active_node)
-            operands.active_node = ""
+            operand_index.set_context("")
 
         def end_teardown():
-            operands.active_node = teardown_prior.pop()
+            operand_index.set_context(teardown_prior.pop())
 
         request.addfinalizer(end_teardown)
-        operands.active_node = ""
+        operand_index.set_context("")
         try:
             return (yield)
         finally:
-            operands.active_node = prior
+            operand_index.set_context(prior)
             request.addfinalizer(begin_teardown)
 
 
