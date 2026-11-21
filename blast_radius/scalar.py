@@ -1,4 +1,4 @@
-"""Locate isolated changes to scalar configuration on a dialect class."""
+"""Locate isolated changes to scalar configuration on a profiled SQLGlot class."""
 
 import ast
 
@@ -25,7 +25,11 @@ def _assignment(stmt):
 
 def consumers(selector, path, change, old_tree, new_tree):
     """Return test numbers, or None if the ordinary coverage is required."""
-    if not path.startswith("sqlglot/dialects/") or not change.old_lines or change.insertion_anchors:
+    component = path.startswith(("sqlglot/generators/", "sqlglot/parsers/")) or path in (
+        "sqlglot/generator.py", "sqlglot/parser.py")
+    if not (path.startswith("sqlglot/dialects/") or component):
+        return None
+    if not change.old_lines or change.insertion_anchors:
         return None
     if not selector.scalar_reads or len(old_tree.body) != len(new_tree.body):
         return None

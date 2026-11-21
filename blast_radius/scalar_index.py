@@ -11,9 +11,10 @@ from pathlib import Path
 import re
 import sys
 
-from . import operands
+from . import arguments, flag_guards, operands
 
 _module = "sqlglot.dialects.dialect"
+_components = {"sqlglot.generator": "Generator", "sqlglot.parser": "Parser"}
 _records = defaultdict(lambda: defaultdict(set))
 _ancestry = {}
 _process = 0
@@ -26,7 +27,7 @@ def ancestry(cls):
         chain = []
         for base in type.__getattribute__(cls, "__mro__"):
             module = type.__getattribute__(base, "__module__")
-            if module.startswith("sqlglot.dialects."):
+            if module.startswith(("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.")) or module in _components:
                 name = module + "." + type.__getattribute__(base, "__qualname__")
                 chain.append(name)
                 _records[name]
@@ -61,7 +62,30 @@ def named_namespace(obj, key):
     return obj.__dict__
 
 
+class ComponentMeta(type):
+    __getattribute__ = read_class
+
+
+def flag_value(obj, name, kind, var, module, cls, masks_when):
+    receiver = type(obj)
+    if (type(receiver) is ComponentMeta and receiver.__getattribute__ is read_instance
+            and flag_guards.masked(sys._getframe(1), kind, var, module, cls, masks_when)):
+        # read_instance delegates to object after recording. Only bypass it
+        # for a real boolean value with no property or descriptor involved.
+        owner = next((base for base in type.__getattribute__(receiver, "__mro__")
+                      if name in type.__getattribute__(base, "__dict__")), None)
+        if owner and type(type.__getattribute__(owner, "__dict__")[name]) is bool:
+            value = object.__getattribute__(obj, name)
+            if type(value) is not bool:
+                record(receiver, name)
+            return value
+    return getattr(obj, name)
+
+
 class Rewrite(ast.NodeTransformer):
+    def __init__(self, module):
+        self.component = _components.get(module)
+
     def visit_Call(self, node):
         self.generic_visit(node)
         op = node.func
@@ -75,7 +99,15 @@ class Rewrite(ast.NodeTransformer):
 
     def visit_ClassDef(self, node):
         self.generic_visit(node)
-        names = {"Dialect": "_rwx_read_instance", "_Dialect": "_rwx_read_class"}
+        if self.component:
+            if node.name != self.component:
+                return node
+            if node.keywords or node.bases:
+                raise ValueError("upstream component now has a custom base or metaclass")
+            node.keywords.append(ast.keyword("metaclass", ast.Name("_rwx_component_meta", ast.Load())))
+            names = {self.component: "_rwx_read_instance"}
+        else:
+            names = {"Dialect": "_rwx_read_instance", "_Dialect": "_rwx_read_class"}
         if node.name in names:
             if any(isinstance(n, ast.FunctionDef) and n.name == "__getattribute__" for n in node.body):
                 raise ValueError("upstream dialect already has a custom lookup")
@@ -90,8 +122,16 @@ class Loader(SourceFileLoader):
         raw = self.get_data(self.path)
         tree = compile(raw, self.path, "exec", ast.PyCF_ONLY_AST, dont_inherit=True)
         module.__dict__.update(_rwx_read_instance=read_instance, _rwx_read_class=read_class,
-                               _rwx_named_namespace=named_namespace)
-        tree = Rewrite().visit(tree)
+                               _rwx_named_namespace=named_namespace, _rwx_component_meta=ComponentMeta)
+        if module.__name__ in _components:
+            flag_guards.annotate(tree)
+            module.__dict__["_rwx_flag_value"] = flag_value
+        if module.__name__ == "sqlglot.expressions.core":
+            arguments.instrument(tree)
+            module.__dict__["_rwx_observe_arguments"] = lambda expr: arguments.observe(
+                expr, "" if _imports else operands.active_node)
+        else:
+            tree = Rewrite(module.__name__).visit(tree)
         exec(compile(ast.fix_missing_locations(tree), self.path, "exec", dont_inherit=True), module.__dict__)
 
 
@@ -124,7 +164,7 @@ class Finder:
             if fullname == _module:
                 raise RuntimeError("unrecognized dialect loader")
             return None
-        loader = DialectScope if fullname == _module else ImportScope
+        loader = DialectScope if fullname in (_module, "sqlglot.expressions.core") or fullname in _components else ImportScope
         spec.loader = loader(fullname, spec.origin)
         return spec
 
@@ -148,6 +188,8 @@ def install():
     def save():
         capture = {owner: {key: sorted(items) for key, items in reads.items()}
                    for owner, reads in _records.items()}
+        for owner, keys in arguments.records.items():
+            capture["arguments:" + owner] = {key: sorted(items) for key, items in keys.items()}
         output.write_text(json.dumps(capture, separators=(",", ":")))
 
     Finalize(None, save, exitpriority=1)

@@ -23,7 +23,7 @@ from .equivalence import same_module, same_patched_module
 from .patches import FileDiff, apply_to_text, parse_patch
 from .probe import probe
 from .recall import eager_imports_changed, shared_fixture_consumers
-from . import lazy, scalar
+from . import arguments, lazy, scalar
 from .replay import equivalent, expression_change
 from .scheduling import fill_idle_time, schedule
 
@@ -256,7 +256,7 @@ class Selector:
                     return True
         return False
 
-    def arg_type_consumers(self, path, shape, change, old_tree, new_tree):
+    def arg_type_consumers(self, path, shape, change, old_tree, new_tree, single_file, affected):
         """Narrow value-only edits to a concrete Expression's arg_types."""
         if (not path.startswith("sqlglot/expressions/") or not change.old_lines
                 or change.insertion_anchors or not self.expressions):
@@ -298,7 +298,12 @@ class Selector:
             finally:
                 other.value = patched_value
             key = path.removesuffix(".py").replace("/", ".") + "." + original.name
-            return self.translate(self.expressions.get(key, ()))
+            if single_file:
+                contexts = arguments.changed_contexts(self.scalar_reads.get("arguments:" + key),
+                                                      assignment.value, patched_value)
+                if contexts is not None:
+                    return self.translate(contexts)
+            return affected | self.translate(self.expressions.get(key, ()))
         return None
 
     def configuration_consumers(self, path, change, old_tree, new_tree):
@@ -432,12 +437,14 @@ class Selector:
                 return self.all
             tracked = scalar.consumers(self, path, change, old_tree, new_tree) if single_file else None
             if tracked is not None:
-                return affected | tracked | self.uncovered
+                # Evaluating a class-body literal does not consume its value.
+                # Import-time reads already force a fallback in scalar.consumers.
+                return readers | owned | tracked | self.uncovered
             configuration = self.configuration_consumers(path, change, old_tree, new_tree) if single_file else None
             if configuration is not None:
                 return affected | configuration | self.uncovered
-            arg_types = self.arg_type_consumers(path, shape, change, old_tree, new_tree)
-            affected = self.collection_effects(path, affected) if arg_types is None else affected | arg_types
+            arg_types = self.arg_type_consumers(path, shape, change, old_tree, new_tree, single_file, affected)
+            affected = self.collection_effects(path, affected) if arg_types is None else owned | readers | arg_types
         return affected | self.uncovered
 
     def data_effects(self, path: str):

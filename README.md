@@ -10,7 +10,7 @@ Shared fixture setup and teardown contribute coverage to every test in the fixtu
 
 A second run of the clean suite records operand samples for comparisons, capped at 24 distinct pairs per test and source location. For an isolated change to one operator or one literal, the selector evaluates the old and new comparison on the recorded inputs. It keeps tests with unknown operators, overloaded equality, missing observations, shared fixture dependencies, or differing results. The same checks apply to any incoming diff.
 
-For isolated class configuration edits, the selector can also consult clean-suite records of scalar attribute lookups and individual dictionary key reads. A bulk dictionary read or an import-time dependency triggers a wider selection. Handler tables have a separate index of calls to individual lambdas and closures returned by simple factories. Complex factories use the existing coverage fallback.
+For isolated class configuration edits, the selector consults clean-suite records of scalar attribute lookups on dialects, parsers and generators, and individual dictionary key reads. For boolean flags in a short-circuit condition, the profile can discount a read when a side-effect-free second operand already determines the result. For changes to an expression’s required arguments, the profile records which tests validated an object with the affected argument missing. A bulk dictionary read or an import-time dependency triggers a wider selection. Handler tables have a separate index of calls to individual lambdas and closures returned by simple factories. Complex factories use the existing coverage fallback.
 
 Workers are assigned using the recorded test durations and the two-second cost per worker. The scheduler checks one through eight workers, balances the load, and attempts a bounded exact search for small selections when the lower bound suggests a better arrangement. Unscheduled short tests can use spare worker time up to the existing peak.
 
@@ -43,7 +43,7 @@ python3 tools/verify_sample.py "$kit" --source /path/to/pinned/sqlglot \
   --index coverage.json.gz --runs 3 --require-no-misses
 ```
 
-On the 30-patch public sample the selector caught all 73 labeled failures and scored 106.632 simulated seconds. Commit `a031a6b` reached the same public score. On 13 local patches chosen to exercise branch selection and companion file edits, simulated time fell from 342.715 to 123.997 seconds. Four additional seeded mutations scored 12.505 seconds with either version. Both versions selected all 102 observed failing test/patch pairs across those 17 patches. The official practice and final batches use different patches.
+Against commit `5a724c1`, the public sample improved from 106.632 to 104.118 simulated seconds with all 73 failures selected. Twelve additional local patches to parser flags, generator flags and expression schemas improved from 311.353 to 85.637 seconds, with all 39 failing test/patch pairs selected. The older 17-patch validation batch improved from 136.502 to 136.419 seconds with all 102 pairs selected. These batches have different patch mixes from the organizer’s practice and final batches.
 
 ## Refresh the coverage maps
 
