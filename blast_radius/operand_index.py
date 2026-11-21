@@ -11,7 +11,7 @@ import sys
 from multiprocessing.reduction import ForkingPickler
 from multiprocessing.util import Finalize
 
-from . import dispatch, map_reads, operands
+from . import dispatch, lazy, map_reads, operands
 
 _installed = None
 
@@ -35,6 +35,8 @@ def install():
         capture = map_reads.snapshot() if os.environ.get("RWX_OBSERVE_MAPS") == "1" else operands.encoded()
         if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch":
             capture = {site: {node: ["call"] for node in reads} for site, reads in dispatch.sites.items()}
+        if os.environ.get("RWX_OBSERVE_MAPS") == "lazy":
+            capture = {site: {node: ["visit"] for node in nodes} for site, nodes in lazy.reads.items()}
         path.write_text(json.dumps(capture, separators=(",", ":")))
     Finalize(None, save, exitpriority=-5)
 

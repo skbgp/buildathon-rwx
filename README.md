@@ -4,6 +4,8 @@ This entry uses test coverage from the unmodified SQLGlot checkout to select and
 
 The index records pytest node IDs, Python line coverage, tests that read fixtures or source files, and use of dialect and expression classes. Process pool work and its serialization are attributed to the test that submitted the job. We map coverage back to the catalogue's test numbers at runtime. Patch parsing accounts for insertions, deletions, renames, multiple files, multiline expressions, and invalid Python. Changes that cannot be localized fall back to a wider set of tests.
 
+For inserted statements the selector can use the next executed statement in the same branch. It checks scope changes before narrowing the selection. For short-circuit conditions and conditional expressions it records which tests entered each operand or branch during clean execution. Import and shared-fixture visits to an expression keep the broader selection.
+
 Shared fixture setup and teardown contribute coverage to every test in the fixture scope. Collection-time code also contributes dependencies when a function runs during module initialization.
 
 A second run of the clean suite records operand samples for comparisons, capped at 24 distinct pairs per test and source location. For an isolated change to one operator or one literal, the selector evaluates the old and new comparison on the recorded inputs. It keeps tests with unknown operators, overloaded equality, missing observations, shared fixture dependencies, or differing results. The same checks apply to any incoming diff.
@@ -41,7 +43,7 @@ python3 tools/verify_sample.py "$kit" --source /path/to/pinned/sqlglot \
   --index coverage.json.gz --runs 3 --require-no-misses
 ```
 
-On the 30-patch public sample the selector caught all 73 labeled failures and scored 106.632 simulated seconds. The previous release scored 128.539 simulated seconds on the same sample. The official practice and final batches use different patches.
+On the 30-patch public sample the selector caught all 73 labeled failures and scored 106.632 simulated seconds. Commit `a031a6b` reached the same public score. On 13 local patches chosen to exercise branch selection and companion file edits, simulated time fell from 342.715 to 123.997 seconds. Four additional seeded mutations scored 12.505 seconds with either version. Both versions selected all 102 observed failing test/patch pairs across those 17 patches. The official practice and final batches use different patches.
 
 ## Refresh the coverage maps
 
@@ -59,7 +61,7 @@ docker cp "$container:/app/operands.json.gz" operands.json.gz
 docker rm "$container"
 ```
 
-The additional profiles use the same pinned source and tests. Build the `configuration-index` target with its default `PROFILE=1` argument to reproduce the dictionary map, or with `--build-arg PROFILE=dispatch` to trace callable dispatch. Both targets write `/app/profile.json.gz`. The `scalar-index` target writes `/app/scalars.json.gz`.
+The additional profiles use the same pinned source and tests. Build the `configuration-index` target with its default `PROFILE=1` argument to reproduce the dictionary map, or with `--build-arg PROFILE=dispatch` to trace callable dispatch. Both targets write `/app/profile.json.gz`. The `scalar-index` target writes `/app/scalars.json.gz`. The `expression-index` target writes `/app/expressions.json.gz`.
 
 Each build of the submission image downloads the pinned SQLGlot archive and verifies its SHA-256. The submission build reuses the index from this repository. Optional local pytest probes can be enabled with `RWX_PROBE=1`.
 

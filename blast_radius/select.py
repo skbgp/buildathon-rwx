@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import gzip
 import json
@@ -18,11 +18,12 @@ import tokenize
 
 from .configuration import changed_keys
 from .dispatch import changed_site
-from .equivalence import same_module
+from .insertions import following_lines
+from .equivalence import same_module, same_patched_module
 from .patches import FileDiff, apply_to_text, parse_patch
 from .probe import probe
 from .recall import eager_imports_changed, shared_fixture_consumers
-from . import scalar
+from . import lazy, scalar
 from .replay import equivalent, expression_change
 from .scheduling import fill_idle_time, schedule
 
@@ -31,7 +32,7 @@ FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 RUNTIME_ROOTS = ("sqlglot/", "tests/")
 PROJECT_FILES = frozenset({"pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "setup.py"})
 SAFE_DOC_ROOTS = ("docs/", "posts/", "pdoc/", ".github/")
-DIRECTIVE = re.compile(r"#\s*(?:coding\s*[:=]|type:|\!|pragma:|noqa\b)", re.IGNORECASE)
+DIRECTIVE = re.compile(r"#(?:[^\r\n]*?\bcoding\s*[:=]|\s*(?:type:|!|pragma:|noqa\b))", re.IGNORECASE)
 DIALECT_GROUPS = ("dialects", "generators", "parsers", "typing")
 
 
@@ -116,6 +117,56 @@ def source_shape(tree):
     return SourceShape(tree)
 
 
+def localize_mixed_edits(path, change, original, patched_tree):
+    """Discard standalone comment edits only when the remaining edits produce the same AST."""
+    edits = []
+    skipped = False
+    removed_lines = set()
+    anchors = set()
+    for hunk in change.hunks:
+        cursor = hunk.old_start - bool(hunk.old_count)
+        start = cursor
+        added = []
+        deleted = []
+        for kind, line in (*hunk.lines, (" ", "")):
+            if kind == "+":
+                added.append(line)
+                continue
+            if kind == "-":
+                deleted.append(line)
+                cursor += 1
+                continue
+            if added or deleted:
+                comment_only = all(
+                    (not value.strip() or value.lstrip().startswith("#"))
+                    and not DIRECTIVE.search(value) for value in (*added, *deleted)
+                )
+                if comment_only:
+                    skipped = True
+                else:
+                    edits.append((start, cursor, added))
+                    removed_lines.update(range(start + 1, cursor + 1))
+                    if not deleted:
+                        anchors.add(start)
+                added, deleted = [], []
+            cursor += 1
+            start = cursor
+    if not skipped or not edits:
+        return change, patched_tree
+    # A line that looks like a comment could actually be inside a string.
+    # Rebuild the proposed source and check all AST fields, including constants.
+    lines = original.splitlines(keepends=True)
+    for start, stop, added in reversed(edits):
+        lines[start:stop] = added
+    try:
+        revised = ast.parse("".join(lines), filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return change, patched_tree
+    if not same_module(revised, patched_tree):
+        return change, patched_tree
+    return replace(change, old_lines=removed_lines, insertion_anchors=anchors), revised
+
+
 class Selector:
     def __init__(self, source: Path, index: dict, tests: list[Test]):
         self.source = source
@@ -129,6 +180,8 @@ class Selector:
         self.operand_sites = {}
         self.dispatch = {}
         self.dispatch_paths = set()
+        self.lazy_sites = {}
+        self.lazy_paths = set()
         self.configurations = {}
         self.configuration_paths = set()
         self.operand_files = set()
@@ -138,7 +191,8 @@ class Selector:
         self.by_file = defaultdict(set)
         number_for = {t.node: t.number for t in tests}
         self.index_numbers = [number_for.get(node, -1) for node in nodes]
-        self.cohorts = [self.translate(items) for items in index["cohorts"]]
+        self.cohorts = index["cohorts"]
+        self.translated_cohorts = {}
         self.uncovered = self.all - set(self.index_numbers)
         self.uncovered.update(number_for[node] for node in index["nonpasses"] if node in number_for)
         for test in tests:
@@ -147,13 +201,19 @@ class Selector:
     def translate(self, items):
         return {number for i in items if (number := self.index_numbers[i]) >= 0}
 
+    def cohort(self, number):
+        group = self.translated_cohorts.get(number)
+        if group is None:
+            group = self.translated_cohorts[number] = self.translate(self.cohorts[number])
+        return group
+
     def lines(self, file_info, lines):
         result = set()
         by_line = file_info["lines"]
         for line in lines:
             cohort = by_line.get(str(line))
             if cohort is not None:
-                result.update(self.cohorts[cohort])
+                result.update(self.cohort(cohort))
         return result
 
     @lru_cache(maxsize=64)
@@ -173,7 +233,7 @@ class Selector:
                 for group in DIALECT_GROUPS:
                     sibling = self.files.get(f"sqlglot/{group}/{dialect}.py", {"lines": {}})
                     for cohort in set(sibling["lines"].values()):
-                        consumers.update(self.cohorts[cohort])
+                        consumers.update(self.cohort(cohort))
                 return affected | consumers | self.by_file.get(f"tests/dialects/test_{dialect}.py", set())
         if path in self.by_file:
             if self.test_module_is_shared(path):
@@ -188,8 +248,13 @@ class Selector:
             rf"\b{cls}\s*\.\s*(?:arg_types|required_args)\b"
             rf"|\bclass\s+\w+\s*\([^)]*\b{cls}\b",
         )
-        return any(references.search(path.read_bytes().decode("utf-8", errors="replace"))
-                   for root in RUNTIME_ROOTS for path in (self.source / root).rglob("*.py"))
+        token = name.encode("utf-8")
+        for root in RUNTIME_ROOTS:
+            for path in (self.source / root).rglob("*.py"):
+                raw = path.read_bytes()
+                if token in raw and references.search(raw.decode("utf-8", errors="replace")):
+                    return True
+        return False
 
     def arg_type_consumers(self, path, shape, change, old_tree, new_tree):
         """Narrow value-only edits to a concrete Expression's arg_types."""
@@ -290,20 +355,22 @@ class Selector:
         owned = self.by_file.get(path, set())
         old_text = read_source(self.source / path)
         new_text = apply_to_text(old_text, change)
+        old_tree = baseline_tree(self.source / path)
+        readers = self.translate(self.readers.get(path, ()))
         try:
             new_tree = ast.parse(new_text, filename=path, type_comments=True)
-            # ast.parse accepts some invalid statements, e.g. a return at
-            # module scope. A compile failure may break every dependent import.
+            if same_patched_module(old_tree, new_tree, change):
+                if not DIRECTIVE.search("\n".join(
+                    line for hunk in change.hunks for kind, line in hunk.lines if kind != " "
+                )):
+                    return readers
+            # Parsing alone accepts statements such as a return at module scope.
+            # An equal AST already has the pinned module's validated semantics.
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             return owned if owned and not self.test_module_is_shared(path) else self.all
-        old_tree = baseline_tree(self.source / path)
-        readers = self.translate(self.readers.get(path, ()))
-        if same_module(old_tree, new_tree, change.old_lines):
-            if not DIRECTIVE.search("\n".join(
-                line for hunk in change.hunks for kind, line in hunk.lines if kind != " "
-            )):
-                return readers
+        if len(change.hunks) > 1 or (change.old_lines and change.insertion_anchors):
+            change, new_tree = localize_mixed_edits(path, change, old_text, new_tree)
         if single_file and path in self.dispatch_paths:
             site = changed_site(path, change, old_tree, new_tree, self.dispatch)
             if site is not None:
@@ -322,7 +389,10 @@ class Selector:
                 changed_lines.update(shape.comparable_lines(old_line))
             if owner is None:
                 import_time = True
-        for anchor in change.insertion_anchors:
+        witness = following_lines(change, old_tree, new_tree, shape, info) if change.insertion_anchors else None
+        if witness is not None:
+            changed_lines.update(witness)
+        for anchor in change.insertion_anchors if witness is None else ():
             before = shape.function_at(anchor)
             after = shape.function_at(anchor + 1)
             if before is after and before is not None:
@@ -336,11 +406,14 @@ class Selector:
                 import_time = True
         # A function body can execute while pytest imports its test modules
         # (metaclasses and default factories are common examples).
-        if not import_time and changed_lines.intersection(info["collection"]):
+        visits = None
+        if single_file and not import_time and path in self.lazy_paths:
+            visits = lazy.changed_consumers(path, change, old_tree, new_tree, self.lazy_sites, shape)
+        if visits is None and changed_lines.intersection(info["collection"]):
             import_time = True
         if not import_time and owned:
             owned = self.test_body_owners(path, change, shape, old_tree, new_tree)
-        runtime = self.lines(info, changed_lines)
+        runtime = self.lines(info, changed_lines) if visits is None else self.translate(visits)
         if single_file and not import_time and path in self.operand_files:
             mutation = expression_change(shape, change, old_tree, new_tree)
             if mutation:
@@ -352,7 +425,7 @@ class Selector:
         for line in changed_lines:
             cohort = info.get("shared", {}).get(str(line))
             if cohort is not None:
-                runtime.update(self.cohorts[cohort])
+                runtime.update(self.cohort(cohort))
         affected = runtime | owned | readers
         if import_time:
             if path.startswith("sqlglot/") and eager_imports_changed(old_tree, new_tree):
@@ -399,14 +472,45 @@ class Selector:
             return set()
         return self.all
 
+    def input_only(self, change):
+        """Identify companion files whose effects are captured by their source/data readers."""
+        path = change.old_path
+        if not path or path != change.new_path or not change.hunks or change.binary:
+            return False
+        if not path.endswith(".py"):
+            return (path.startswith(SAFE_DOC_ROOTS) or
+                    path.startswith("tests/fixtures/") and path in self.readers)
+        if not path.startswith(RUNTIME_ROOTS) or path.endswith("/conftest.py"):
+            return False
+        modified = [line for hunk in change.hunks for kind, line in hunk.lines if kind != " "]
+        if any((line.strip() and not line.lstrip().startswith("#")) or DIRECTIVE.search(line)
+               for line in modified):
+            return False
+        original = read_source(self.source / path)
+        revised = ast.parse(apply_to_text(original, change), filename=path, type_comments=True)
+        return same_patched_module(baseline_tree(self.source / path), revised, change)
+
     def select(self, text: str):
         selected = set()
         try:
             changes = parse_patch(text)
             if not changes and text.strip():
                 return set(self.all)
-            for change in changes:
-                selected.update(self.one_file(change, len(changes) == 1))
+            # Fixture/source readers cover the companion edits independently.
+            # Other tests see just the remaining executable patch.
+            executable = []
+            if len(changes) > 1:
+                for change in changes:
+                    if not self.input_only(change):
+                        executable.append(change)
+                    elif change.old_path.endswith(".py"):
+                        selected.update(self.translate(self.readers.get(change.old_path, ())))
+                    else:
+                        selected.update(self.one_file(change))
+            else:
+                executable = changes
+            for change in executable:
+                selected.update(self.one_file(change, len(executable) == 1))
                 if len(selected) == len(self.all):
                     break
         except (TypeError, ValueError, OSError, SyntaxError, UnicodeError, RecursionError):
@@ -450,6 +554,8 @@ def main():
         selector.configuration_paths = paths(selector.configurations)
         selector.dispatch = profile("dispatch.json.gz", "maps")
         selector.dispatch_paths = paths(selector.dispatch)
+        selector.lazy_sites = profile("expressions.json.gz", "maps")
+        selector.lazy_paths = paths(selector.lazy_sites)
         selector.scalar_reads = profile("scalars.json.gz", "scalars")
     by_number = {t.number: t for t in tests}
     durations = {t.number: t.duration for t in tests}

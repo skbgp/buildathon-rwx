@@ -51,3 +51,44 @@ def same_module(
     return same_ast(before.type_ignores, after.type_ignores) and all(
         same_ast(left, right) for left, right in unchanged
     )
+
+
+def same_patched_module(before, after, change):
+    """Match original type-ignore comments at their new locations after line shifts."""
+    if not before.type_ignores and not after.type_ignores:
+        return same_module(before, after, change.old_lines)
+    if len(before.type_ignores) != len(after.type_ignores):
+        return False
+    # An unchanged directive follows the surrounding lines through the diff.
+    # A deleted directive cannot be matched simply because its tag reappears.
+    shifts = []
+    for hunk in change.hunks:
+        line = hunk.old_start - bool(hunk.old_count)
+        for kind, _ in hunk.lines:
+            if kind == "+":
+                shifts.append((line + 1, 1))
+            else:
+                line += 1
+                if kind == "-":
+                    shifts.append((line + 1, -1))
+    for old, new in zip(before.type_ignores, after.type_ignores):
+        shift = sum(delta for line, delta in shifts if line <= old.lineno)
+        if old.lineno in change.old_lines or old.lineno + shift != new.lineno or old.tag != new.tag:
+            return False
+    saved = after.type_ignores
+    after.type_ignores = before.type_ignores
+    try:
+        return same_module(before, after, change.old_lines)
+    finally:
+        after.type_ignores = saved
+
+
+def nodes_at_line(root, line):
+    """Walk only subtrees that span a source line."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if hasattr(node, "lineno") and not node.lineno <= line <= getattr(node, "end_lineno", node.lineno):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))

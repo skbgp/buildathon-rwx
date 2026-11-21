@@ -3,7 +3,7 @@
 import ast
 import operator
 
-from .equivalence import same_ast, same_module
+from .equivalence import nodes_at_line, same_ast, same_module
 
 ORDERING = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}
 OPS = (ast.Is, ast.IsNot, ast.Eq, ast.NotEq, *ORDERING)
@@ -52,7 +52,7 @@ def expression_change(shape, change, old_tree, new_tree):
     sites = {(expr.lineno, expr.col_offset): expr for expr in ast.walk(stmt) if candidate(expr)}
     if not sites:
         return None
-    for other in ast.walk(new_tree):
+    for other in nodes_at_line(new_tree, line):
         if not candidate(other):
             continue
         old = sites.get((other.lineno, other.col_offset))

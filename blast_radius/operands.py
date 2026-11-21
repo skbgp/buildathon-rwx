@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import weakref
 
-from . import dispatch, map_reads
+from . import dispatch, lazy, map_reads
 from .replay import candidate
 
 active_node = ""
@@ -117,6 +117,15 @@ class Transformer(ast.NodeTransformer):
 
 class Loader(SourceFileLoader):
     def exec_module(self, module):
+        if os.environ.get("RWX_OBSERVE_MAPS") != "lazy":
+            return self._exec(module)
+        lazy.import_depth += 1
+        try:
+            return self._exec(module)
+        finally:
+            lazy.import_depth -= 1
+
+    def _exec(self, module):
         raw = self.get_data(self.path)
         helper = "_rwx_clean_compare"
         while helper.encode() in raw:
@@ -130,6 +139,9 @@ class Loader(SourceFileLoader):
             visit.changed = True
         if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch" and dispatch.instrument(tree, visit.path, helper + "_call"):
             module.__dict__[helper + "_call"] = dispatch.observe
+            visit.changed = True
+        if os.environ.get("RWX_OBSERVE_MAPS") == "lazy" and lazy.instrument(tree, visit.path, helper + "_visit"):
+            module.__dict__[helper + "_visit"] = lazy.observe
             visit.changed = True
         if not visit.changed:
             return super().exec_module(module)
@@ -163,6 +175,7 @@ def install(root):
         _owner = os.getpid()
     map_reads.active_context = lambda: active_node
     dispatch.active_context = lambda: active_node
+    lazy.active_context = lambda: active_node
     if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch":
         dispatch.start()
     if not any(isinstance(finder, Finder) for finder in sys.meta_path):
