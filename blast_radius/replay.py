@@ -9,24 +9,35 @@ ORDERING = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.
 OPS = (ast.Is, ast.IsNot, ast.Eq, ast.NotEq, *ORDERING)
 
 
+def literal(expr):
+    if isinstance(expr, ast.Constant) and type(expr.value) in (int, str, bool, type(None)):
+        return True, expr.value
+    if (isinstance(expr, ast.UnaryOp) and isinstance(expr.op, (ast.UAdd, ast.USub))
+            and isinstance(expr.operand, ast.Constant) and type(expr.operand.value) is int):
+        return True, ast.literal_eval(expr)
+    if (isinstance(expr, ast.Tuple) and len(expr.elts) <= 8
+            and all(isinstance(item, ast.Constant) and type(item.value) is int for item in expr.elts)):
+        return True, tuple(item.value for item in expr.elts)
+    return False, None
+
+
 def candidate(node):
     if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.ops[0], OPS):
         return False
 
     def attribute(expr):
-        return isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name)
+        if isinstance(expr, ast.Attribute):
+            return isinstance(expr.value, ast.Name) or attribute(expr.value)
+        return False
 
-    def scalar(expr):
-        return isinstance(expr, ast.Constant) and type(expr.value) in (int, str, bool, type(None))
-
-    left, right = node.left, node.comparators[0]
     def simple(expr):
         return (isinstance(expr, ast.Name) or attribute(expr) or
                 isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
                 and expr.func.id == "len" and len(expr.args) == 1 and not expr.keywords)
 
+    left, right = node.left, node.comparators[0]
     return (attribute(left) and attribute(right)
-            or scalar(left) and simple(right) or simple(left) and scalar(right))
+            or literal(left)[0] and simple(right) or simple(left) and literal(right)[0])
 
 
 def expression_change(shape, change, old_tree, new_tree):
@@ -54,18 +65,17 @@ def expression_change(shape, change, old_tree, new_tree):
             # Introducing identity comparisons with a non-singleton literal
             # can raise a SyntaxWarning while a test imports the module.
             operands = (old.left, old.comparators[0], other.left, other.comparators[0])
-            if any(isinstance(value, ast.Constant) and value.value is not None
-                   and type(value.value) is not bool for value in operands):
+            if any(valid and value is not None and type(value) is not bool
+                   for valid, value in map(literal, operands)):
                 continue
         edits = []
         for name, x, y in (("left", old.left, other.left),
                            ("right", old.comparators[0], other.comparators[0])):
             if not same_ast(x, y):
-                if not isinstance(x, ast.Constant) or not isinstance(y, ast.Constant):
+                valid, replacement = literal(y)
+                if not literal(x)[0] or not valid:
                     break
-                if type(y.value) not in (str, int, bool, type(None)):
-                    break
-                edits.append((name, y.value))
+                edits.append((name, replacement))
         else:
             if len(edits) + (type(old_op) is not type(new_op)) != 1:
                 continue
@@ -89,8 +99,11 @@ def _result(operation, left, right, identical):
     if operation in ORDERING:
         # A string Enum can implement its own ordering independently of
         # equality. Replay ordering only on exact builtin value types.
-        if left_type == right_type and left_type in ("int", "str"):
-            return ORDERING[operation](left[1], right[1])
+        if left_type == right_type:
+            if left_type in ("int", "str"):
+                return ORDERING[operation](left[1], right[1])
+            if left_type == "int_tuple":
+                return ORDERING[operation](left[1:], right[1:])
         return None
     if left_type == "none" or right_type == "none":
         matches = left_type == right_type
@@ -98,7 +111,9 @@ def _result(operation, left, right, identical):
         matches = left[1] == right[1]
     elif left_type == right_type == "object":
         matches = identical
-    elif left_type in ("object", "opaque_builtin") or right_type in ("object", "opaque_builtin"):
+    elif left_type == "opaque_builtin" or right_type == "opaque_builtin":
+        return None
+    elif left_type == "object" or right_type == "object":
         return None
     else:
         matches = left == right
@@ -117,6 +132,8 @@ def equivalent(samples, old_op, new_op, edits):
             replacement = ["none"]
         elif isinstance(value, int):
             replacement = ["int", int(value)]
+        elif isinstance(value, tuple):
+            replacement = ["int_tuple", *value]
         else:
             replacement = ["str", value]
     for left, right, identical in samples:

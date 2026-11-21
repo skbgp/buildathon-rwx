@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import weakref
 
+from . import dispatch, map_reads
 from .replay import candidate
 
 active_node = ""
@@ -39,6 +40,8 @@ def specimen(value):
         return ("int", int(value)) if value.bit_length() <= 64 else None
     if cls is str:
         return ("str", value) if len(value) <= 64 else None
+    if cls is tuple and len(value) <= 8 and all(type(v) is int and v.bit_length() <= 64 for v in value):
+        return ("int_tuple", *value)
     # Metaclasses may customize hashing or comparison. Never invoke their
     # methods just to record an operand in the clean checkout.
     if any(cls is builtin for builtin in (list, tuple, dict, set, frozenset, bytes, float, complex)):
@@ -96,7 +99,7 @@ class Transformer(ast.NodeTransformer):
         self.changed = False
 
     def visit_Compare(self, node):
-        eligible = candidate(node)
+        eligible = not os.environ.get("RWX_OBSERVE_MAPS") and candidate(node)
         self.generic_visit(node)
         if not eligible:
             return node
@@ -121,6 +124,13 @@ class Loader(SourceFileLoader):
         tree = compile(raw, self.path, "exec", ast.PyCF_ONLY_AST, dont_inherit=True)
         visit = Transformer(Path(self.path).relative_to(self.root).as_posix(), helper)
         tree = visit.visit(tree)
+        maps = os.environ.get("RWX_OBSERVE_MAPS") == "1"
+        if maps and map_reads.instrument(tree, visit.path, helper + "_mapping"):
+            module.__dict__[helper + "_mapping"] = map_reads.ObservedMapping
+            visit.changed = True
+        if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch" and dispatch.instrument(tree, visit.path, helper + "_call"):
+            module.__dict__[helper + "_call"] = dispatch.observe
+            visit.changed = True
         if not visit.changed:
             return super().exec_module(module)
         module.__dict__[helper + "_left"] = left_operand
@@ -149,7 +159,12 @@ def install(root):
     global _owner
     if _owner != os.getpid():
         observations.clear()
+        map_reads.readers.clear()
         _owner = os.getpid()
+    map_reads.active_context = lambda: active_node
+    dispatch.active_context = lambda: active_node
+    if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch":
+        dispatch.start()
     if not any(isinstance(finder, Finder) for finder in sys.meta_path):
         sys.meta_path.insert(0, Finder(root))
 

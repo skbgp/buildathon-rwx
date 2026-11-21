@@ -5,18 +5,24 @@ from concurrent.futures import ProcessPoolExecutor
 import gzip
 import json
 import os
+import re
 from pathlib import Path
 import sys
 from multiprocessing.reduction import ForkingPickler
 from multiprocessing.util import Finalize
 
-from . import operands
+from . import dispatch, map_reads, operands
 
 _installed = None
 
 
 def install():
     global _installed
+    argv = sys.orig_argv
+    if "-c" in argv:
+        code = argv[argv.index("-c") + 1]
+        if re.fullmatch(r"from multiprocessing\.resource_tracker import main;main\(\d+\)", code):
+            return
     if _installed == os.getpid():
         return
     _installed = os.getpid()
@@ -26,7 +32,10 @@ def install():
     # A marker without a completed snapshot makes the whole index unusable.
     path.touch()
     def save():
-        path.write_text(json.dumps(operands.encoded(), separators=(",", ":")))
+        capture = map_reads.snapshot() if os.environ.get("RWX_OBSERVE_MAPS") == "1" else operands.encoded()
+        if os.environ.get("RWX_OBSERVE_MAPS") == "dispatch":
+            capture = {site: {node: ["call"] for node in reads} for site, reads in dispatch.sites.items()}
+        path.write_text(json.dumps(capture, separators=(",", ":")))
     Finalize(None, save, exitpriority=-5)
 
 
@@ -123,4 +132,8 @@ def merge(directory, output):
 if __name__ == "__main__":
     if sys.argv[1:] == ["run"]:
         raise SystemExit(run())
-    merge(Path(sys.argv[1]), Path(sys.argv[2]))
+    if sys.argv[1] == "maps":
+        from .map_index import merge
+        merge(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        merge(Path(sys.argv[1]), Path(sys.argv[2]))

@@ -16,10 +16,13 @@ import re
 import time
 import tokenize
 
+from .configuration import changed_keys
+from .dispatch import changed_site
 from .equivalence import same_module
 from .patches import FileDiff, apply_to_text, parse_patch
 from .probe import probe
 from .recall import eager_imports_changed, shared_fixture_consumers
+from . import scalar
 from .replay import equivalent, expression_change
 from .scheduling import fill_idle_time, schedule
 
@@ -53,14 +56,26 @@ def block_start(node: ast.AST) -> int:
     return min((node.lineno, *(x.lineno for x in getattr(node, "decorator_list", ()))))
 
 
+@lru_cache(maxsize=24)
+def baseline_tree(path):
+    return ast.parse(read_source(path), filename=str(path), type_comments=True)
+
+
 class SourceShape:
     def __init__(self, tree: ast.Module):
+        statements = []
+        functions = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.stmt, ast.ExceptHandler)):
+                statements.append(node)
+            if isinstance(node, (*FUNCTIONS, ast.Lambda)):
+                functions.append(node)
         self.statements = sorted(
-            (node for node in ast.walk(tree) if isinstance(node, (ast.stmt, ast.ExceptHandler))),
+            statements,
             key=lambda node: (node.end_lineno - block_start(node), -node.col_offset),
         )
         self.functions = sorted(
-            (node for node in ast.walk(tree) if isinstance(node, (*FUNCTIONS, ast.Lambda))),
+            functions,
             key=lambda node: (node.end_lineno - node.lineno, -node.col_offset),
         )
         self.classes = [node for node in self.statements if isinstance(node, ast.ClassDef)]
@@ -96,6 +111,11 @@ class SourceShape:
         return range(start, max(line + 1, stop))
 
 
+@lru_cache(maxsize=16)
+def source_shape(tree):
+    return SourceShape(tree)
+
+
 class Selector:
     def __init__(self, source: Path, index: dict, tests: list[Test]):
         self.source = source
@@ -105,7 +125,12 @@ class Selector:
         self.collection_reads = index["collection_reads"]
         self.dialects = index.get("dialects", {})
         self.expressions = index.get("expressions", {})
+        self.scalar_reads = {}
         self.operand_sites = {}
+        self.dispatch = {}
+        self.dispatch_paths = set()
+        self.configurations = {}
+        self.configuration_paths = set()
         self.operand_files = set()
         nodes = index["nodes"]
         self.by_number = {t.number: t for t in tests}
@@ -211,6 +236,55 @@ class Selector:
             return self.translate(self.expressions.get(key, ()))
         return None
 
+    def configuration_consumers(self, path, change, old_tree, new_tree):
+        if path not in self.configuration_paths:
+            return None
+        mutation = changed_keys(path, change, old_tree, new_tree)
+        if mutation is None:
+            return None
+        site, changed = mutation
+        reads = self.configurations.get(site)
+        if not reads or reads.get("*"):
+            return None
+        consumers = set(reads.get("*", ()))
+        for key in changed:
+            consumers.update(reads.get(f"key:{key}", ()))
+        if -1 in consumers:
+            return None
+        selected = self.translate(consumers)
+        return selected | shared_fixture_consumers(self, selected)
+
+    def test_body_owners(self, path, change, shape, old_tree, new_tree):
+        """A body-only edit to one collected test preserves sibling tests' definitions."""
+        owned = self.by_file.get(path, set())
+        if not owned or not change.old_lines or change.insertion_anchors:
+            return owned
+        owners = {shape.function_at(line) for line in change.old_lines}
+        if len(owners) != 1:
+            return owned
+        function = owners.pop()
+        if not isinstance(function, FUNCTIONS) or not function.name.startswith("test"):
+            return owned
+        for outer, revised_outer in zip(old_tree.body, new_tree.body):
+            if not isinstance(outer, ast.ClassDef) or not isinstance(revised_outer, ast.ClassDef):
+                continue
+            if function not in outer.body or len(outer.body) != len(revised_outer.body):
+                continue
+            revised = revised_outer.body[outer.body.index(function)]
+            if type(revised) is not type(function):
+                return owned
+            original_body = revised.body
+            revised.body = function.body
+            try:
+                if not same_module(old_tree, new_tree, change.old_lines):
+                    return owned
+            finally:
+                revised.body = original_body
+            exact = f"{path}::{outer.name}::{function.name}"
+            matched = {n for n in owned if self.by_number[n].node.split("[", 1)[0] == exact}
+            return matched or owned
+        return owned
+
     def python_effects(self, path: str, change: FileDiff, single_file=True):
         info = self.files.get(path, {"lines": {}, "collection": []})
         owned = self.by_file.get(path, set())
@@ -223,14 +297,21 @@ class Selector:
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             return owned if owned and not self.test_module_is_shared(path) else self.all
-        old_tree = ast.parse(old_text, filename=path, type_comments=True)
+        old_tree = baseline_tree(self.source / path)
         readers = self.translate(self.readers.get(path, ()))
         if same_module(old_tree, new_tree, change.old_lines):
             if not DIRECTIVE.search("\n".join(
                 line for hunk in change.hunks for kind, line in hunk.lines if kind != " "
             )):
                 return readers
-        shape = SourceShape(old_tree)
+        if single_file and path in self.dispatch_paths:
+            site = changed_site(path, change, old_tree, new_tree, self.dispatch)
+            if site is not None:
+                calls = self.dispatch[site].get("key:call", ())
+                if -1 not in calls:
+                    consumers = self.translate(calls)
+                    return readers | owned | consumers | shared_fixture_consumers(self, consumers) | self.uncovered
+        shape = source_shape(old_tree)
         changed_lines = set()
         import_time = False
         for old_line in change.old_lines:
@@ -257,6 +338,8 @@ class Selector:
         # (metaclasses and default factories are common examples).
         if not import_time and changed_lines.intersection(info["collection"]):
             import_time = True
+        if not import_time and owned:
+            owned = self.test_body_owners(path, change, shape, old_tree, new_tree)
         runtime = self.lines(info, changed_lines)
         if single_file and not import_time and path in self.operand_files:
             mutation = expression_change(shape, change, old_tree, new_tree)
@@ -274,6 +357,12 @@ class Selector:
         if import_time:
             if path.startswith("sqlglot/") and eager_imports_changed(old_tree, new_tree):
                 return self.all
+            tracked = scalar.consumers(self, path, change, old_tree, new_tree) if single_file else None
+            if tracked is not None:
+                return affected | tracked | self.uncovered
+            configuration = self.configuration_consumers(path, change, old_tree, new_tree) if single_file else None
+            if configuration is not None:
+                return affected | configuration | self.uncovered
             arg_types = self.arg_type_consumers(path, shape, change, old_tree, new_tree)
             affected = self.collection_effects(path, affected) if arg_types is None else affected | arg_types
         return affected | self.uncovered
@@ -342,14 +431,26 @@ def main():
     except (OSError, ValueError, KeyError):
         selector = None
     if selector is not None:
-        try:
-            with gzip.open(args.index.with_name("operands.json.gz"), "rt", encoding="utf-8") as stream:
-                operand_index = json.load(stream)
-            if operand_index["nodes"] == nodes:
-                selector.operand_sites = operand_index["sites"]
-                selector.operand_files = {site.rsplit(":", 2)[0] for site in selector.operand_sites}
-        except (OSError, ValueError, KeyError):
-            pass
+        def profile(filename, field):
+            try:
+                with gzip.open(args.index.with_name(filename), "rt", encoding="utf-8") as stream:
+                    data = json.load(stream)
+                if data["nodes"] == nodes:
+                    return data[field]
+            except (OSError, ValueError, KeyError):
+                pass
+            return {}
+
+        def paths(data):
+            return {site.rsplit(":", 2)[0] for site in data}
+
+        selector.operand_sites = profile("operands.json.gz", "sites")
+        selector.operand_files = paths(selector.operand_sites)
+        selector.configurations = profile("configurations.json.gz", "maps")
+        selector.configuration_paths = paths(selector.configurations)
+        selector.dispatch = profile("dispatch.json.gz", "maps")
+        selector.dispatch_paths = paths(selector.dispatch)
+        selector.scalar_reads = profile("scalars.json.gz", "scalars")
     by_number = {t.number: t for t in tests}
     durations = {t.number: t.duration for t in tests}
     extras = sorted(durations.items(), key=lambda pair: (pair[1], pair[0]))

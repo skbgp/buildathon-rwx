@@ -8,6 +8,8 @@ Shared fixture setup and teardown contribute coverage to every test in the fixtu
 
 A second run of the clean suite records operand samples for comparisons, capped at 24 distinct pairs per test and source location. For an isolated change to one operator or one literal, the selector evaluates the old and new comparison on the recorded inputs. It keeps tests with unknown operators, overloaded equality, missing observations, shared fixture dependencies, or differing results. The same checks apply to any incoming diff.
 
+For isolated class configuration edits, the selector can also consult clean-suite records of scalar attribute lookups and individual dictionary key reads. A bulk dictionary read or an import-time dependency triggers a wider selection. Handler tables have a separate index of calls to individual lambdas and closures returned by simple factories. Complex factories use the existing coverage fallback.
+
 Workers are assigned using the recorded test durations and the two-second cost per worker. The scheduler checks one through eight workers, balances the load, and attempts a bounded exact search for small selections when the lower bound suggests a better arrangement. Unscheduled short tests can use spare worker time up to the existing peak.
 
 ## Build and verify
@@ -39,7 +41,7 @@ python3 tools/verify_sample.py "$kit" --source /path/to/pinned/sqlglot \
   --index coverage.json.gz --runs 3 --require-no-misses
 ```
 
-On the 30-patch public sample, this entry selected all 73 labeled failures and scored 128.539 simulated seconds. The previous submission scored 178.780 simulated seconds on the same sample. The median including CPU for this revision was 129.5 seconds in three local Linux-container runs. Six independently constructed patches covered import errors, a shared SQL fixture, and comparison changes. The previous revision missed failures on three of them. This revision selected every observed failure across all six. Hidden practice and final patches will differ.
+On the 30-patch public sample the selector caught all 73 labeled failures and scored 106.632 simulated seconds. The previous release scored 128.539 simulated seconds on the same sample. The official practice and final batches use different patches.
 
 ## Refresh the coverage maps
 
@@ -56,6 +58,8 @@ container=$(docker create --platform linux/amd64 blast-operands)
 docker cp "$container:/app/operands.json.gz" operands.json.gz
 docker rm "$container"
 ```
+
+The additional profiles use the same pinned source and tests. Build the `configuration-index` target with its default `PROFILE=1` argument to reproduce the dictionary map, or with `--build-arg PROFILE=dispatch` to trace callable dispatch. Both targets write `/app/profile.json.gz`. The `scalar-index` target writes `/app/scalars.json.gz`.
 
 Each build of the submission image downloads the pinned SQLGlot archive and verifies its SHA-256. The submission build reuses the index from this repository. Optional local pytest probes can be enabled with `RWX_PROBE=1`.
 
